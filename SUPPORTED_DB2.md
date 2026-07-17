@@ -12,10 +12,10 @@ The checked-in catalog targets retail build `12.1.0.68209` and contains:
 | --- | ---: | --- |
 | Catalog schemas | 1,319 | Tables represented by the generated wowdbd schema graph |
 | Catalog-declared loadable tables | 1,130 | Schemas with DB2 filename, WDC5 layout hash, and physical field metadata |
-| Metadata-only schemas | 189 | Known schemas without a matching DB2/layout in the source export |
+| Metadata-only schemas | 189 | Known schemas without complete filename, layout, and physical-field metadata |
 | Logical columns | 10,339 | Named columns exposed through the catalog API |
 | Physical WDC5 fields | 7,417 | Decoder fields used by the loadable definitions |
-| Declared links | 2,914 | Parent/child relationships available to catalog consumers |
+| Declared links | 2,914 | 2,913 resolvable parent/child links plus 1 preserved unresolved link |
 
 Every load is checked against its generated layout hash. Data from another retail build fails closed when
 the layout differs instead of being decoded with an incompatible schema.
@@ -25,6 +25,10 @@ The generated source of truth is `src/GeneratedSchemaCatalog.inc`. Use `catalog:
 An available definition still requires the corresponding file to be mounted; the host verifies the actual
 file and layout hash when loading it. The full list is kept generated rather than duplicated here so this
 document cannot silently drift from the catalog.
+
+Against the current local `12.1.0.68209` export, 1,129 of the 1,130 catalog-declared tables match their file
+layout and physical field count. `CraftingQualityAtlasSet` is the sole mismatch (file layout `4FC8E439`,
+catalog layout `9BD23E0F`) and therefore fails closed until either the file or generated schema is updated.
 
 ## Tables currently used by gameplay compatibility
 
@@ -72,9 +76,11 @@ if (catalog::Load("CreatureDisplayInfo", table, &error))
 }
 ```
 
-Loading is on demand through the 64-bit host. Runtime receives an architecture-neutral decoded snapshot and
-builds only the compact indexes its consumer needs. A new gameplay feature still requires explicit hooks and
-consumer logic; catalog availability alone never replaces native client storage.
+Loading is on demand through the 64-bit host. Runtime receives the full requested table as an
+architecture-neutral decoded snapshot; its consumer should derive compact indexes and then release the
+table. The host caches requested decoded snapshots for its process lifetime, so modules should not bulk-load
+all catalog tables. A new gameplay feature still requires explicit hooks and consumer logic; catalog
+availability alone never replaces native client storage.
 
 ## Decoder boundary
 

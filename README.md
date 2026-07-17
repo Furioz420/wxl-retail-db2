@@ -68,7 +68,8 @@ rows, and relationship data. The injected runtime receives decoded snapshots thr
 transport; it does not parse DB2 files or mount archives itself.
 
 The focused declarations in `src/Schemas.hpp` remain the startup set used by item/equipment compatibility.
-They use the same host-extension DB2 API and are cross-checked alongside the generated global catalog.
+They use the same host-extension DB2 API and are validated independently alongside the generated global
+catalog.
 
 The tables currently consumed eagerly for item/equipment compatibility are:
 
@@ -81,7 +82,6 @@ The tables currently consumed eagerly for item/equipment compatibility are:
 - `ModelFileData`
 - `TextureFileData`
 - `ComponentModelFileData`
-- `ComponentTextureFileData`
 
 `ComponentTextureFileData` has a focused declaration but is not currently loaded by the item bootstrap.
 All other catalog-declared tables can be loaded on demand when their corresponding file is mounted. The
