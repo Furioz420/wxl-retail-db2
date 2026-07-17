@@ -2,7 +2,7 @@
 // Copyright (C) 2026 WarcraftXL. GPLv3.
 
 #include "../src/Schemas.hpp"
-#include "runtime/db2/Wdc5.hpp"
+#include "wxl-host-extension/shared/db2/Wdc5.hpp"
 
 #include <cctype>
 #include <fstream>
@@ -32,7 +32,7 @@ namespace
             Schema schema{definition.layoutHash, {}};
             schema.shapes.reserve(definition.fields.size());
             for (const runtimeDb2::Field& field : definition.fields)
-                schema.shapes.push_back({field.elements});
+                schema.shapes.push_back({field.elements, field.words, field.string});
             return schema;
         }
         return {};
@@ -69,6 +69,17 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    std::vector<uint8_t> snapshot;
+    runtimeDb2::wdc5::Table roundTrip;
+    if (!table.SaveSnapshot(snapshot, &error) ||
+        !roundTrip.LoadSnapshot(snapshot.data(), snapshot.size(), schema.hash, &error) ||
+        roundTrip.Rows().size() != table.Rows().size() ||
+        roundTrip.LayoutHash() != table.LayoutHash())
+    {
+        std::cerr << "snapshot round-trip failed: " << error << '\n';
+        return 1;
+    }
+
     const runtimeDb2::wdc5::Row* selected = nullptr;
     std::vector<const runtimeDb2::wdc5::Row*> selectedParents;
     bool parentQuery = false;
@@ -100,7 +111,7 @@ int main(int argc, char** argv)
             for (size_t e = 0; e < table.ElementCount(f); ++e)
             {
                 if (e) std::cout << ',';
-                std::cout << table.Value(row, f, e);
+                std::cout << table.Value64(row, f, e);
             }
         }
         std::cout << '\n';
