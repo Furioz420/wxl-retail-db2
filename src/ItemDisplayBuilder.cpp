@@ -48,6 +48,8 @@ namespace wxl::scripts::retaildb2::displaybuilder
             std::string slot;
             std::string side;
             bool collection = false;
+            bool usesRaceGenderSuffix = false;
+            bool usesSeparatedRaceGenderSuffix = false;
         };
 
         std::string Lower(std::string value)
@@ -216,19 +218,22 @@ namespace wxl::scripts::retaildb2::displaybuilder
             {
                 case 1: return 0; case 3: return 1; case 4: return 2; case 5: case 20: return 3;
                 case 6: return 4; case 7: return 5; case 8: return 6; case 9: return 7;
-                case 10: return 8; case 16: return 9; case 19: return 10;
+                case 10: return 8; case 16: return 10; case 19: return 9;
                 default: return static_cast<uint32_t>(-1);
             }
         }
 
-        uint32_t Attach(uint32_t inventoryType, size_t modelIndex, bool collection,
-                        std::string_view slot, std::string_view model)
+        uint32_t Attach(uint32_t inventoryType, size_t modelIndex, uint32_t modelType,
+                        bool collection, std::string_view slot, std::string_view model)
         {
             static constexpr uint32_t none = static_cast<uint32_t>(-1);
             const uint32_t side = modelIndex == 0 ? 0 : 1;
             switch (inventoryType)
             {
-                case 1: return side == 0 ? 11 : 55;
+                // Some retail head displays point at a full-character collection mesh rather
+                // than a dedicated attachment-local helm. Attaching those to Head/Head2 applies
+                // the head transform a second time and leaves the visible geoset above the player.
+                case 1: return collection && modelType == 1 ? 19 : (side == 0 ? 11 : 55);
                 case 3: return side == 0 ? 6 : 5;
                 case 4: case 5: case 19: case 20: return collection ? 19 : 34;
                 case 6: return (slot == "belt" || Contains(Lower(std::string(model)), "_belt")) ? 53 : (collection ? 19 : 53);
@@ -236,7 +241,9 @@ namespace wxl::scripts::retaildb2::displaybuilder
                 case 8: return collection ? 19 : (side == 0 ? 47 : 48);
                 case 9: return collection ? 19 : (side == 0 ? 3 : 4);
                 case 10: return collection ? 19 : (side == 0 ? 1 : 2);
-                case 16: return 12;
+                // ModelType 1 retail capes are skinned in full character/root space (their
+                // bounds start around the feet). Other cape M2s retain the normal back point.
+                case 16: return modelType == 1 ? 19 : 12;
                 default: return collection ? 19 : none;
             }
         }
@@ -356,6 +363,31 @@ namespace wxl::scripts::retaildb2::displaybuilder
             out.collection = Contains(lower, kCollectionMarker);
             out.folder = ObjectFolder(out.path);
             std::string name = out.collection ? AfterMarker(out.path, kCollectionMarker) : Basename(out.path);
+
+            // ComponentModelFileData resources can contain only race/gender-specific files. Preserve
+            // that contract before collapsing the selected filename to a WotLK-style model stem;
+            // otherwise slots whose vanilla default is race-neutral (notably modern 3D capes) request
+            // a nonexistent unsuffixed M2 and render WoW's fallback cube.
+            const std::string suffixStem = Lower(WithoutExtension(name));
+            const size_t genderSep = suffixStem.find_last_of('_');
+            if (genderSep != std::string::npos && genderSep + 2 == suffixStem.size() &&
+                (suffixStem[genderSep + 1] == 'm' || suffixStem[genderSep + 1] == 'f'))
+            {
+                const size_t raceSep = suffixStem.find_last_of('_', genderSep - 1);
+                if (raceSep != std::string::npos && genderSep - raceSep == 3 &&
+                    IsRaceCode(std::string_view(suffixStem).substr(raceSep + 1, 2)))
+                {
+                    out.usesRaceGenderSuffix = true;
+                    out.usesSeparatedRaceGenderSuffix = true;
+                }
+            }
+            else if (suffixStem.size() >= 4 && suffixStem[suffixStem.size() - 4] == '_' &&
+                     (suffixStem.back() == 'm' || suffixStem.back() == 'f') &&
+                     IsRaceCode(std::string_view(suffixStem).substr(suffixStem.size() - 3, 2)))
+            {
+                out.usesRaceGenderSuffix = true;
+            }
+
             name = StripRaceGender(name);
             const size_t dot = name.find_last_of('.');
             if (dot != std::string::npos) name.replace(dot, std::string::npos, ".mdx");
@@ -544,8 +576,12 @@ namespace wxl::scripts::retaildb2::displaybuilder
 
                 itemdisplay::ModelEntry entry;
                 entry.modelSlot = ModelSlot(display.inventoryType);
-                entry.attachId = Attach(display.inventoryType, modelIndex, info.collection, info.slot, info.model);
-                entry.modelFlags = 0xffffffffu;
+                entry.attachId = Attach(display.inventoryType, modelIndex,
+                                        display.modelTypes[modelIndex],
+                                        info.collection, info.slot, info.model);
+                entry.modelFlags = info.usesRaceGenderSuffix
+                    ? (0x80u | (info.usesSeparatedRaceGenderSuffix ? 0x40u : 0u))
+                    : 0xffffffffu;
                 entry.textureFlags = 0xffffffffu;
                 entry.folder = directSnapshot->Intern(info.folder);
                 entry.model = directSnapshot->Intern(info.model);
@@ -611,8 +647,12 @@ namespace wxl::scripts::retaildb2::displaybuilder
 
                 itemdisplay::ModelEntry entry;
                 entry.modelSlot = ModelSlot(display.inventoryType);
-                entry.attachId = Attach(display.inventoryType, modelIndex, info.collection, info.slot, info.model);
-                entry.modelFlags = 0xffffffffu;
+                entry.attachId = Attach(display.inventoryType, modelIndex,
+                                        display.modelTypes[modelIndex],
+                                        info.collection, info.slot, info.model);
+                entry.modelFlags = info.usesRaceGenderSuffix
+                    ? (0x80u | (info.usesSeparatedRaceGenderSuffix ? 0x40u : 0u))
+                    : 0xffffffffu;
                 entry.textureFlags = 0xffffffffu;
                 entry.folder = index->Intern(info.folder);
                 entry.model = index->Intern(info.model);
@@ -722,8 +762,14 @@ namespace wxl::scripts::retaildb2::displaybuilder
                             if (targets.empty()) continue;
                             itemdisplay::ModelEntry entry;
                             entry.modelSlot = ModelSlot(display.inventoryType);
-                            entry.attachId = Attach(display.inventoryType, overlayIndex, true, info.slot, info.model);
-                            entry.modelFlags = 0xffffffffu;
+                            // Overlay candidates are not restricted to the two ItemDisplayInfo
+                            // model columns (a shoulder resource can yield left/right/generic).
+                            // They are collection overlays, never root-skinned cape entries.
+                            entry.attachId = Attach(display.inventoryType, overlayIndex, 0,
+                                                    true, info.slot, info.model);
+                            entry.modelFlags = info.usesRaceGenderSuffix
+                                ? (0x80u | (info.usesSeparatedRaceGenderSuffix ? 0x40u : 0u))
+                                : 0xffffffffu;
                             entry.textureFlags = 0xffffffffu;
                             entry.folder = index->Intern(info.folder);
                             entry.model = index->Intern(info.model);
@@ -760,15 +806,15 @@ namespace wxl::scripts::retaildb2::displaybuilder
             const auto display = displays.find(displayId);
             const auto chosen = selectedModels.find(displayId);
             if (display == displays.end() || chosen == selectedModels.end()) continue;
-            // ModelMatRes.TextureType identifies the replaceable M2 texture type, not an
-            // absolute texture-combo layer.  Keep a separate occurrence counter per type:
-            // some displays legitimately provide more than one texture of the same type.
-            // The equip-side patcher resolves this ordinal against each batch's combo.
-            std::array<std::unordered_map<uint32_t, uint32_t>, 2> typeOccurrence;
-            std::array<uint32_t, 2> untypedLayer{};
+            // Rows are sorted by texture type/id before reaching the builder. The legacy CSV
+            // path assigned their layer as an absolute per-model texture-combo position.
+            // VirtualPath consumes that absolute layer directly; resetting the counter for
+            // each TextureType makes (for example) type 2 and type 3 both overwrite layer 0.
+            std::array<uint32_t, 2> modelLayer{};
             for (const ModelMaterialSource& source : rows)
             {
                 if (source.modelIndex >= 2) continue;
+                const uint32_t layer = modelLayer[source.modelIndex]++;
                 const ModelInfo& model = chosen->second[source.modelIndex];
                 if (model.model.empty()) continue;
                 const auto textureFile = textureFiles.find(source.materialResource);
@@ -785,9 +831,7 @@ namespace wxl::scripts::retaildb2::displaybuilder
                 itemdisplay::MaterialEntry entry;
                 entry.modelIndex = source.modelIndex;
                 entry.modelColumn = source.modelIndex;
-                entry.layer = source.textureType == static_cast<uint32_t>(-1)
-                    ? untypedLayer[source.modelIndex]++
-                    : typeOccurrence[source.modelIndex][source.textureType]++;
+                entry.layer = layer;
                 entry.textureType = source.textureType;
                 entry.folder = index->Intern(ObjectFolder(texturePath->second));
                 entry.model = index->Intern(model.model);

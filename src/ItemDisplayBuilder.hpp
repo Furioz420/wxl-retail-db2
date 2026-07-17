@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "runtime/db2/ItemDisplayIndex.hpp"
+#include "wxl-host-extension/shared/db2/ItemDisplayIndex.hpp"
 
 #include <array>
 #include <cstdint>
@@ -21,6 +21,7 @@ namespace wxl::scripts::retaildb2::displaybuilder
         uint32_t inventoryType = 0;
         std::array<uint32_t, 2> modelResources{};
         std::array<uint32_t, 2> modelMaterials{};
+        std::array<uint32_t, 2> modelTypes{};
     };
 
     struct ModelMaterialSource
