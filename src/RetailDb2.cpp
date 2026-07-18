@@ -29,6 +29,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -303,7 +304,7 @@ namespace wxl::scripts::retaildb2
             return it == paths.end() ? empty : it->second;
         }
 
-        bool BuildIndexes()
+        bool BuildIndexes(std::unique_ptr<displaybuilder::MaterialService>& materialService)
         {
             std::string catalogError;
             if (!catalog::Validate(&catalogError))
@@ -608,21 +609,21 @@ namespace wxl::scripts::retaildb2
             // retail display, consumes the refresh, and remains naked until a later login/logout rebuild.
             g_items = std::move(items);
             g_displays = std::move(displays);
+            // The demand material service keeps a read-only reference to this process-lifetime map.
+            // Publish it before moving the large display/material source maps into the service.
+            g_fileDataPaths = std::move(paths);
             g_lookupReady.store(true, std::memory_order_release);
 
-            auto itemDisplayIndex = displaybuilder::Build(
-                builderDisplays, modelFiles, componentModelPositions, textureFiles,
-                modelMaterials, componentMaterials,
-                appearanceOrder, paths,
+            materialService = displaybuilder::Build(
+                std::move(builderDisplays), modelFiles, componentModelPositions,
+                std::move(textureFiles), std::move(modelMaterials), componentMaterials,
+                appearanceOrder, g_fileDataPaths,
                 &ReadWholeFile);
-            if (!itemDisplayIndex)
+            if (!materialService)
             {
                 WLOG_WARN("retail-db2: failed to derive item-display attachment/material index");
                 return false;
             }
-            runtimeDb2::itemdisplay::Publish(std::move(itemDisplayIndex));
-
-            g_fileDataPaths = std::move(paths);
             return true;
         }
 
@@ -992,13 +993,16 @@ namespace wxl::scripts::retaildb2
             return 1;
         }
 
-        /** Lua: ready, failed = GetRetailDB2Status(). */
+        /** Lua: ready, failed, resolvedMaterialDisplays = GetRetailDB2Status(). */
         int __cdecl ScriptGetRetailDb2Status(void* state)
         {
             const auto pushBoolean = wxl::game::Native<luaoff::LuaPushBooleanFn>(luaoff::kLuaPushBoolean);
             pushBoolean(state, g_ready.load(std::memory_order_acquire));
             pushBoolean(state, g_failed.load(std::memory_order_acquire));
-            return 2;
+            const auto current = runtimeDb2::itemdisplay::Current();
+            wxl::game::Native<luaoff::LuaPushNumberFn>(luaoff::kLuaPushNumber)(
+                state, current ? static_cast<double>(current->resolvedMaterialDisplays.size()) : 0.0);
+            return 3;
         }
 
         bool InstallStorageOverlay(uintptr_t minAddress, uintptr_t maxAddress, uintptr_t tableAddress,
@@ -1095,7 +1099,12 @@ namespace wxl::scripts::retaildb2
             const uint32_t native = g_originalLookup ? g_originalLookup(storage, edx, id, output) : 0;
             if (native || !g_lookupReady.load(std::memory_order_acquire)) return native;
             if (storage == reinterpret_cast<void*>(db2::item::kStorageObject)) return FillItem(id, output);
-            if (storage == reinterpret_cast<void*>(db2::itemdisplayinfo::kStorageObject)) return FillDisplay(id, output);
+            if (storage == reinterpret_cast<void*>(db2::itemdisplayinfo::kStorageObject))
+            {
+                const uint32_t found = FillDisplay(id, output);
+                if (found) runtimeDb2::itemdisplay::Request(id);
+                return found;
+            }
             return 0;
         }
 
@@ -1125,11 +1134,13 @@ namespace wxl::scripts::retaildb2
             // invariants beyond min/max/idTable; publishing a synthetic table caused a null-call crash shortly
             // after character selection. Keep the proven accessor-only fallback until those paths are hooked
             // individually.
-            const bool ok = BuildIndexes();
+            std::unique_ptr<displaybuilder::MaterialService> materialService;
+            const bool ok = BuildIndexes(materialService);
             g_failed.store(!ok, std::memory_order_release);
             g_ready.store(ok, std::memory_order_release);
             if (!ok) WLOG_WARN("retail-db2: disabled because startup indexing failed");
             else WLOG_INFO("retail-db2: ready items=%zu displays=%zu", g_items.size(), g_displays.size());
+            if (materialService) materialService->Run();
             return 0;
         }
 
@@ -1189,6 +1200,40 @@ do
     if watcher then
         watcher:RegisterEvent("ADDON_LOADED")
         watcher:SetScript("OnEvent", wrapCContainer)
+    end
+
+    -- Glue creates its character model while the host is still deriving the slow material phase.
+    -- Re-select the already selected character once that immutable snapshot is complete.  This runs
+    -- from Glue's UI thread, never from the DB2 loader or an M2 traversal callback.
+    local glueDb2Watcher = CreateFrame and CreateFrame("Frame")
+    if glueDb2Watcher then
+        local elapsed = 0
+        local lastResolved = -1
+        glueDb2Watcher:SetScript("OnUpdate", function(self, delta)
+            -- The same registered script also runs in FrameXML.  It has no Glue model to repair.
+            if WorldFrame and not CharacterSelect then
+                self:SetScript("OnUpdate", nil)
+                return
+            end
+            elapsed = elapsed + (delta or 0)
+            if elapsed < 0.25 then return end
+            elapsed = 0
+            local ready, failed, resolved = GetRetailDB2Status()
+            if failed then
+                self:SetScript("OnUpdate", nil)
+                return
+            end
+            if ready and CharacterSelect and CharacterSelect.IsShown and
+               CharacterSelect:IsShown() and CharacterSelect.selectedIndex and
+               CharacterSelect.selectedIndex > 0 and
+               type(CharacterSelect_SelectCharacter) == "function" then
+                resolved = resolved or 0
+                if resolved ~= lastResolved then
+                    lastResolved = resolved
+                    CharacterSelect_SelectCharacter(CharacterSelect.selectedIndex, 1)
+                end
+            end
+        end)
     end
 end
 )lua");

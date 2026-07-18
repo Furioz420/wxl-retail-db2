@@ -8,12 +8,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <map>
 #include <set>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 
@@ -25,6 +27,7 @@ namespace wxl::scripts::retaildb2::displaybuilder
     {
         constexpr std::string_view kObjectMarker = "item\\objectcomponents\\";
         constexpr std::string_view kCollectionMarker = "item\\objectcomponents\\collections\\";
+        constexpr uint32_t kInventoryTypeCloak = 16;
 
         struct SkinBatch
         {
@@ -471,11 +474,79 @@ namespace wxl::scripts::retaildb2::displaybuilder
             for (uint32_t i = 0; i < filter.count; ++i) filter.ids[i] = ids[i];
         }
 
-        std::shared_ptr<itemdisplay::Index> CloneModelSnapshot(const itemdisplay::Index& source)
+        using SelectedModels = std::unordered_map<uint32_t, std::array<ModelInfo, 2>>;
+        using SkinCache = std::unordered_map<std::string, SkinInfo>;
+
+        const SkinInfo& SkinFor(const ModelInfo& model, ReadAssetFn readAsset, SkinCache& cache)
+        {
+            const std::string key = Normalize(model.path);
+            auto [it, inserted] = cache.try_emplace(key);
+            if (inserted) it->second = ReadSkin(model, readAsset);
+            return it->second;
+        }
+
+        void AppendMaterialRows(
+            itemdisplay::Index& destination,
+            uint32_t displayId,
+            const std::vector<ModelMaterialSource>& rows,
+            const std::unordered_map<uint32_t, DisplaySource>& displays,
+            const SelectedModels& selectedModels,
+            const std::unordered_map<uint32_t, uint32_t>& textureFiles,
+            const std::unordered_map<uint32_t, std::string>& paths,
+            ReadAssetFn readAsset,
+            SkinCache& skinCache)
+        {
+            const auto display = displays.find(displayId);
+            const auto chosen = selectedModels.find(displayId);
+            if (display == displays.end() || chosen == selectedModels.end()) return;
+
+            // Layer is the absolute per-model combo position.  Increment it before validating the
+            // linked texture so a malformed row cannot shift every later material onto the wrong
+            // M2 texture slot.
+            std::array<uint32_t, 2> modelLayer{};
+            for (const ModelMaterialSource& source : rows)
+            {
+                if (source.modelIndex >= 2) continue;
+                const uint32_t layer = modelLayer[source.modelIndex]++;
+                const ModelInfo& model = chosen->second[source.modelIndex];
+                if (model.model.empty()) continue;
+                const auto textureFile = textureFiles.find(source.materialResource);
+                if (textureFile == textureFiles.end()) continue;
+                const auto texturePath = paths.find(textureFile->second);
+                if (texturePath == paths.end()) continue;
+
+                const SkinInfo& skin = SkinFor(model, readAsset, skinCache);
+                const auto targets = TargetSections(skin, display->second.inventoryType);
+                const bool hide = !model.collection &&
+                    (display->second.inventoryType == 1 || display->second.inventoryType == 3) &&
+                    source.textureType == 3 && !targets.empty();
+
+                itemdisplay::MaterialEntry entry;
+                entry.modelIndex = source.modelIndex;
+                entry.modelColumn = source.modelIndex;
+                entry.layer = layer;
+                entry.textureType = source.textureType;
+                entry.folder = destination.Intern(ObjectFolder(texturePath->second));
+                entry.model = destination.Intern(model.model);
+                entry.texture = destination.Intern(hide ? "__hide__" : TextureName(texturePath->second));
+                entry.skinSectionIds = destination.Intern(Join(skin.sectionIds));
+                entry.batchIndexes = destination.Intern(JoinBatches(skin.batches));
+                entry.targetSkinSectionIds = destination.Intern(Join(targets));
+                entry.targetBatchIndexes = destination.Intern(JoinBatches(skin.batches, &targets));
+                entry.targetMode = destination.Intern(hide ? "HideSlotGeosets" :
+                    (!targets.empty() ? "SlotGeosets" : (!skin.batches.empty() ? "SkinMapOnly" : "None")));
+                destination.materials[displayId].push_back(entry);
+            }
+        }
+
+        std::shared_ptr<itemdisplay::Index> CloneSnapshot(const itemdisplay::Index& source)
         {
             auto snapshot = std::make_shared<itemdisplay::Index>();
             snapshot->models.reserve(source.models.size());
+            snapshot->materials.reserve(source.materials.size());
             snapshot->strings.reserve(source.strings.size());
+            snapshot->resolvedMaterialDisplays = source.resolvedMaterialDisplays;
+            snapshot->materialsReady = source.materialsReady;
             for (const auto& [displayId, entries] : source.models)
             {
                 auto& copied = snapshot->models[displayId];
@@ -489,16 +560,122 @@ namespace wxl::scripts::retaildb2::displaybuilder
                     copied.push_back(clone);
                 }
             }
+            for (const auto& [displayId, entries] : source.materials)
+            {
+                auto& copied = snapshot->materials[displayId];
+                copied.reserve(entries.size());
+                for (const itemdisplay::MaterialEntry& entry : entries)
+                {
+                    itemdisplay::MaterialEntry clone = entry;
+                    clone.folder = snapshot->Intern(entry.folder ? entry.folder : "");
+                    clone.model = snapshot->Intern(entry.model ? entry.model : "");
+                    clone.texture = snapshot->Intern(entry.texture ? entry.texture : "");
+                    clone.skinSectionIds = snapshot->Intern(entry.skinSectionIds ? entry.skinSectionIds : "");
+                    clone.batchIndexes = snapshot->Intern(entry.batchIndexes ? entry.batchIndexes : "");
+                    clone.targetSkinSectionIds = snapshot->Intern(
+                        entry.targetSkinSectionIds ? entry.targetSkinSectionIds : "");
+                    clone.targetBatchIndexes = snapshot->Intern(
+                        entry.targetBatchIndexes ? entry.targetBatchIndexes : "");
+                    clone.targetMode = snapshot->Intern(entry.targetMode ? entry.targetMode : "");
+                    copied.push_back(clone);
+                }
+            }
             return snapshot;
         }
+
+        class DemandMaterialService final : public MaterialService
+        {
+        public:
+            DemandMaterialService(
+                std::unordered_map<uint32_t, DisplaySource> displays,
+                SelectedModels selectedModels,
+                std::unordered_map<uint32_t, uint32_t> textureFiles,
+                std::unordered_map<uint32_t, std::vector<ModelMaterialSource>> modelMaterials,
+                const std::unordered_map<uint32_t, std::string>& paths,
+                ReadAssetFn readAsset,
+                SkinCache skinCache,
+                std::shared_ptr<itemdisplay::Index> current)
+                : displays_(std::move(displays)),
+                  selectedModels_(std::move(selectedModels)),
+                  textureFiles_(std::move(textureFiles)),
+                  modelMaterials_(std::move(modelMaterials)),
+                  paths_(&paths),
+                  readAsset_(readAsset),
+                  skinCache_(std::move(skinCache)),
+                  current_(std::move(current))
+            {
+            }
+
+            void Run() override
+            {
+                for (;;)
+                {
+                    std::vector<uint32_t> requests = itemdisplay::WaitTakeRequests();
+
+                    // Glue and CharacterModelFrame request an equipped set in a tight burst.  A
+                    // short debounce turns that burst into one immutable snapshot/model-map copy.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    std::vector<uint32_t> trailing = itemdisplay::TakeRequests();
+                    requests.insert(requests.end(), trailing.begin(), trailing.end());
+                    std::ranges::sort(requests);
+                    requests.erase(std::unique(requests.begin(), requests.end()), requests.end());
+
+                    std::erase_if(requests, [&](uint32_t displayId) {
+                        return current_->resolvedMaterialDisplays.contains(displayId);
+                    });
+                    if (requests.empty()) continue;
+
+                    auto next = CloneSnapshot(*current_);
+                    const size_t oldRows = [&] {
+                        size_t count = 0;
+                        for (const auto& [id, rows] : next->materials) count += rows.size();
+                        return count;
+                    }();
+
+                    for (uint32_t displayId : requests)
+                    {
+                        const auto rows = modelMaterials_.find(displayId);
+                        if (rows != modelMaterials_.end())
+                            AppendMaterialRows(*next, displayId, rows->second,
+                                               displays_, selectedModels_, textureFiles_, *paths_,
+                                               readAsset_, skinCache_);
+                        // A valid display can intentionally have no model-material rows.  Publish
+                        // that negative result as resolved so future model rebuilds stay cheap.
+                        next->resolvedMaterialDisplays.insert(displayId);
+                    }
+                    next->materialsReady = false;
+
+                    const size_t totalRows = [&] {
+                        size_t count = 0;
+                        for (const auto& [id, rows] : next->materials) count += rows.size();
+                        return count;
+                    }();
+                    itemdisplay::Publish(next);
+                    current_ = std::move(next);
+                    WLOG_INFO("retail-db2: material batch displays=%zu newRows=%zu resolved=%zu totalRows=%zu",
+                              requests.size(), totalRows - oldRows,
+                              current_->resolvedMaterialDisplays.size(), totalRows);
+                }
+            }
+
+        private:
+            std::unordered_map<uint32_t, DisplaySource> displays_;
+            SelectedModels selectedModels_;
+            std::unordered_map<uint32_t, uint32_t> textureFiles_;
+            std::unordered_map<uint32_t, std::vector<ModelMaterialSource>> modelMaterials_;
+            const std::unordered_map<uint32_t, std::string>* paths_;
+            ReadAssetFn readAsset_ = nullptr;
+            SkinCache skinCache_;
+            std::shared_ptr<itemdisplay::Index> current_;
+        };
     }
 
-    std::shared_ptr<itemdisplay::Index> Build(
-        const std::unordered_map<uint32_t, DisplaySource>& displays,
+    std::unique_ptr<MaterialService> Build(
+        std::unordered_map<uint32_t, DisplaySource> displays,
         const std::unordered_map<uint32_t, std::vector<uint32_t>>& modelFiles,
         const std::unordered_map<uint32_t, uint32_t>& componentModelPositions,
-        const std::unordered_map<uint32_t, uint32_t>& textureFiles,
-        const std::unordered_map<uint32_t, std::vector<ModelMaterialSource>>& modelMaterials,
+        std::unordered_map<uint32_t, uint32_t> textureFiles,
+        std::unordered_map<uint32_t, std::vector<ModelMaterialSource>> modelMaterials,
         const std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>& componentMaterials,
         const std::vector<uint32_t>& appearanceOrder,
         const std::unordered_map<uint32_t, std::string>& paths,
@@ -508,15 +685,12 @@ namespace wxl::scripts::retaildb2::displaybuilder
         index->strings.reserve(262144);
         index->models.reserve(displays.size());
 
-        std::unordered_map<uint32_t, std::array<ModelInfo, 2>> selectedModels;
+        SelectedModels selectedModels;
         selectedModels.reserve(displays.size());
         std::map<std::tuple<std::string, std::string, std::string>, ModelInfo> collectionCatalog;
-        std::unordered_map<std::string, SkinInfo> skinCache;
+        SkinCache skinCache;
         auto skinFor = [&](const ModelInfo& model) -> const SkinInfo& {
-            const std::string key = Normalize(model.path);
-            auto [it, inserted] = skinCache.try_emplace(key);
-            if (inserted) it->second = ReadSkin(model, readAsset);
-            return it->second;
+            return SkinFor(model, readAsset, skinCache);
         };
 
         // Resolve one stable race/gender family per model resource and build a collection family catalog.
@@ -555,9 +729,36 @@ namespace wxl::scripts::retaildb2::displaybuilder
             }
         }
 
-        // Publish direct object models before doing any archive/SKIN work. This phase is intentionally
+        // Priority and demand material construction share one exact implementation.  This closure is
+        // used only while Build is active; the returned service owns every source it uses later.
+        auto appendMaterialRows = [&](itemdisplay::Index& destination, uint32_t displayId,
+                                      const std::vector<ModelMaterialSource>& rows)
+        {
+            AppendMaterialRows(destination, displayId, rows, displays, selectedModels,
+                               textureFiles, paths, readAsset, skinCache);
+        };
+
+        std::set<uint32_t> requestedMaterialDisplays;
+        // A cape's T1_T1 batches must already have their retail material rows when Glue or the
+        // initial world CMO creates the equipment slot. Re-selecting the same character does not
+        // reconstruct that native slot, so resolving the rows later only takes effect after a real
+        // unequip/equip. Prewarm every cloak before the first snapshot while leaving all other
+        // inventory types on the demand-driven path.
+        for (const auto& [displayId, display] : displays)
+            if (display.inventoryType == kInventoryTypeCloak)
+                requestedMaterialDisplays.insert(displayId);
+
+        const auto collectMaterialRequests = [&]()
+        {
+            for (uint32_t displayId : itemdisplay::TakeRequests())
+                requestedMaterialDisplays.insert(displayId);
+        };
+
+        // Publish direct object models before the broad archive/SKIN pass. This phase is intentionally
         // limited to normal attachments and dedicated helm/shoulder collection models: shared body
         // collection meshes require geoset filtering and are added by the complete model phase below.
+        // Cloaks are deliberately prewarmed above; other displays pay the targeted SKIN/material cost
+        // only when requested by a live CMO.
         auto directSnapshot = std::make_shared<itemdisplay::Index>();
         directSnapshot->models.reserve(displays.size());
         directSnapshot->strings.reserve(65536);
@@ -590,9 +791,21 @@ namespace wxl::scripts::retaildb2::displaybuilder
                 directSnapshot->models[displayId].push_back(entry);
             }
         }
-        WLOG_INFO("retail-db2: publishing direct item-display models=%zu modelDisplays=%zu strings=%zu",
+        collectMaterialRequests();
+        directSnapshot->materials.reserve(requestedMaterialDisplays.size());
+        for (uint32_t displayId : requestedMaterialDisplays)
+        {
+            const auto rows = modelMaterials.find(displayId);
+            if (rows != modelMaterials.end())
+                appendMaterialRows(*directSnapshot, displayId, rows->second);
+            directSnapshot->resolvedMaterialDisplays.insert(displayId);
+        }
+        WLOG_INFO("retail-db2: publishing direct item-display models=%zu modelDisplays=%zu materials=%zu materialDisplays=%zu priority=%zu strings=%zu",
                   [&] { size_t n=0; for (const auto& [id,v] : directSnapshot->models) n += v.size(); return n; }(),
-                  directSnapshot->models.size(), directSnapshot->strings.size());
+                  directSnapshot->models.size(),
+                  [&] { size_t n=0; for (const auto& [id,v] : directSnapshot->materials) n += v.size(); return n; }(),
+                  directSnapshot->materials.size(), requestedMaterialDisplays.size(),
+                  directSnapshot->strings.size());
         itemdisplay::Publish(std::move(directSnapshot));
 
         struct CollectionSource
@@ -789,70 +1002,29 @@ namespace wxl::scripts::retaildb2::displaybuilder
             }
         }
 
-        // Character select and CharacterModelFrame are created long before the material pass can
-        // finish on a large retail dataset. Publish a self-contained model snapshot now; its interned
-        // pointers remain owned by that immutable snapshot while this builder continues in the background.
-        auto modelSnapshot = CloneModelSnapshot(*index);
-        WLOG_INFO("retail-db2: publishing early item-display models=%zu modelDisplays=%zu strings=%zu",
-                  [&] { size_t n=0; for (const auto& [id,v] : modelSnapshot->models) n += v.size(); return n; }(),
-                  modelSnapshot->models.size(), modelSnapshot->strings.size());
-        itemdisplay::Publish(std::move(modelSnapshot));
-
-        // Material layers are direct ItemDisplayInfoModelMatRes links. Their target batches are derived from
-        // the selected model's SKIN section map, exactly where the old CSV generator obtained them.
-        index->materials.reserve(modelMaterials.size());
-        for (const auto& [displayId, rows] : modelMaterials)
+        // The complete model graph is the startup finish line.  Material SKINs are derived only for
+        // displays requested by Glue/ModelFrames/equip and then published cumulatively by the service.
+        auto modelSnapshot = std::move(index);
+        collectMaterialRequests();
+        modelSnapshot->materials.reserve(requestedMaterialDisplays.size());
+        for (uint32_t displayId : requestedMaterialDisplays)
         {
-            const auto display = displays.find(displayId);
-            const auto chosen = selectedModels.find(displayId);
-            if (display == displays.end() || chosen == selectedModels.end()) continue;
-            // Rows are sorted by texture type/id before reaching the builder. The legacy CSV
-            // path assigned their layer as an absolute per-model texture-combo position.
-            // VirtualPath consumes that absolute layer directly; resetting the counter for
-            // each TextureType makes (for example) type 2 and type 3 both overwrite layer 0.
-            std::array<uint32_t, 2> modelLayer{};
-            for (const ModelMaterialSource& source : rows)
-            {
-                if (source.modelIndex >= 2) continue;
-                const uint32_t layer = modelLayer[source.modelIndex]++;
-                const ModelInfo& model = chosen->second[source.modelIndex];
-                if (model.model.empty()) continue;
-                const auto textureFile = textureFiles.find(source.materialResource);
-                if (textureFile == textureFiles.end()) continue;
-                const auto texturePath = paths.find(textureFile->second);
-                if (texturePath == paths.end()) continue;
-
-                const SkinInfo& skin = skinFor(model);
-                const auto targets = TargetSections(skin, display->second.inventoryType);
-                const bool hide = !model.collection &&
-                    (display->second.inventoryType == 1 || display->second.inventoryType == 3) &&
-                    source.textureType == 3 && !targets.empty();
-
-                itemdisplay::MaterialEntry entry;
-                entry.modelIndex = source.modelIndex;
-                entry.modelColumn = source.modelIndex;
-                entry.layer = layer;
-                entry.textureType = source.textureType;
-                entry.folder = index->Intern(ObjectFolder(texturePath->second));
-                entry.model = index->Intern(model.model);
-                entry.texture = index->Intern(hide ? "__hide__" : TextureName(texturePath->second));
-                entry.skinSectionIds = index->Intern(Join(skin.sectionIds));
-                entry.batchIndexes = index->Intern(JoinBatches(skin.batches));
-                entry.targetSkinSectionIds = index->Intern(Join(targets));
-                entry.targetBatchIndexes = index->Intern(JoinBatches(skin.batches, &targets));
-                entry.targetMode = index->Intern(hide ? "HideSlotGeosets" :
-                    (!targets.empty() ? "SlotGeosets" : (!skin.batches.empty() ? "SkinMapOnly" : "None")));
-                index->materials[displayId].push_back(entry);
-            }
+            const auto rows = modelMaterials.find(displayId);
+            if (rows != modelMaterials.end())
+                appendMaterialRows(*modelSnapshot, displayId, rows->second);
+            modelSnapshot->resolvedMaterialDisplays.insert(displayId);
         }
+        WLOG_INFO("retail-db2: publishing complete item-display models=%zu modelDisplays=%zu materials=%zu materialDisplays=%zu priority=%zu strings=%zu",
+                  [&] { size_t n=0; for (const auto& [id,v] : modelSnapshot->models) n += v.size(); return n; }(),
+                  modelSnapshot->models.size(),
+                  [&] { size_t n=0; for (const auto& [id,v] : modelSnapshot->materials) n += v.size(); return n; }(),
+                  modelSnapshot->materials.size(), requestedMaterialDisplays.size(),
+                  modelSnapshot->strings.size());
+        itemdisplay::Publish(modelSnapshot);
 
-        index->materialsReady = true;
-
-        WLOG_INFO("retail-db2: derived item-display index models=%zu modelDisplays=%zu materials=%zu materialDisplays=%zu strings=%zu",
-                  [&] { size_t n=0; for (const auto& [id,v] : index->models) n += v.size(); return n; }(),
-                  index->models.size(),
-                  [&] { size_t n=0; for (const auto& [id,v] : index->materials) n += v.size(); return n; }(),
-                  index->materials.size(), index->strings.size());
-        return index;
+        return std::make_unique<DemandMaterialService>(
+            std::move(displays), std::move(selectedModels), std::move(textureFiles),
+            std::move(modelMaterials), paths, readAsset, std::move(skinCache),
+            std::move(modelSnapshot));
     }
 }
