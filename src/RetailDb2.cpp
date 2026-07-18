@@ -13,8 +13,10 @@
 #include "offsets/game/DB2.hpp"
 #include "runtime/LuaBindings.hpp"
 #include "runtime/ModuleInstall.hpp"
-#include "runtime/db2/Db2.hpp"
-#include "runtime/db2/ItemDisplayIndex.hpp"
+#include "runtime/storage/ShmClient.hpp"
+#include "wxl-host-extension/shared/db2/Db2.hpp"
+#include "wxl-host-extension/shared/db2/ItemDisplayIndex.hpp"
+#include "wxl-retail-db2/shared/SchemaCatalog.hpp"
 
 #include <windows.h>
 
@@ -27,6 +29,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -62,6 +65,8 @@ namespace wxl::scripts::retaildb2
         GetInventoryTypeFn g_originalGetInventoryType = nullptr;
         using CanGoInSlotFn = uint32_t (__fastcall*)(void* item, void* edx, uint32_t slot, uint32_t flags);
         CanGoInSlotFn g_originalCanGoInSlot = nullptr;
+        using CharacterGeosRenderPrepFn = void (__fastcall*)(void* cmo, void* edx);
+        CharacterGeosRenderPrepFn g_originalCharacterGeosRenderPrep = nullptr;
         std::atomic<bool> g_ready{false};
         // Item/ItemDisplayInfo relationships are complete before the slower SKIN/material build.
         // Glue character models may safely use those accessor fallbacks as soon as this is published.
@@ -73,6 +78,12 @@ namespace wxl::scripts::retaildb2
         constexpr uintptr_t kScriptGetItemIcon = 0x00517020;
         constexpr uintptr_t kGetInventoryType = 0x00707280;
         constexpr uintptr_t kCanGoInSlot = 0x00708500;
+        constexpr uintptr_t kCharacterGeosRenderPrep = 0x004ED900;
+        constexpr uintptr_t kSetGeometryVisible = 0x0082C7C0;
+        constexpr uintptr_t kOptimizeVisibleGeometry = 0x0082C970;
+        constexpr size_t kCmoModel = 0x38;
+        constexpr size_t kCmoChestDisplay = 0x434;
+        constexpr size_t kCmoCapeDisplay = 0x450;
         constexpr char kQuestionMarkIcon[] = "INV_Misc_QuestionMark";
 
         struct ItemBase
@@ -111,6 +122,7 @@ namespace wxl::scripts::retaildb2
             uint32_t flags = 0;
             std::array<uint32_t, 2> modelResources{};
             std::array<uint32_t, 2> modelMaterials{};
+            std::array<uint32_t, 2> modelTypes{};
             std::array<uint32_t, 6> geosets{};
             std::array<uint32_t, 2> helmetVis{};
         };
@@ -237,96 +249,52 @@ namespace wxl::scripts::retaildb2
             return stem;
         }
 
-        uint32_t ReadU32(const uint8_t* data)
-        {
-            uint32_t value = 0;
-            std::memcpy(&value, data, sizeof(value));
-            return value;
-        }
-
-        bool ParseWdc1PathTable(const char* filename, const std::unordered_set<uint32_t>& wanted,
-                                std::unordered_map<uint32_t, std::string>& paths)
-        {
-            constexpr uint32_t kWdc1Magic = 0x31434457u;
-            constexpr size_t kHeaderSize = 84;
-            std::vector<uint8_t> bytes;
-            std::string path = "DBFilesClient\\";
-            path += filename;
-            if (!ReadWholeFile(path.c_str(), bytes))
-            {
-                WLOG_WARN("retail-db2: %s is missing", path.c_str());
-                return false;
-            }
-
-            if (bytes.size() < kHeaderSize || ReadU32(bytes.data()) != kWdc1Magic)
-            {
-                WLOG_WARN("retail-db2: %s is not a DB2Gen WDC1 path table", filename);
-                return false;
-            }
-
-            const uint32_t recordCount = ReadU32(bytes.data() + 4);
-            const uint32_t fieldCount = ReadU32(bytes.data() + 8);
-            const uint32_t recordSize = ReadU32(bytes.data() + 12);
-            const uint32_t stringSize = ReadU32(bytes.data() + 16);
-            const uint32_t fieldStorageSize = ReadU32(bytes.data() + 68);
-            if (fieldCount != 2 || recordSize != 8 || fieldStorageSize != 48)
-            {
-                WLOG_WARN("retail-db2: %s has an unsupported DB2Gen layout", filename);
-                return false;
-            }
-
-            const size_t recordsOffset = kHeaderSize + static_cast<size_t>(fieldCount) * 4;
-            if (recordCount > ((std::numeric_limits<size_t>::max)() - recordsOffset) / recordSize)
-            {
-                WLOG_WARN("retail-db2: %s record block overflows", filename);
-                return false;
-            }
-            const size_t stringsOffset = recordsOffset + static_cast<size_t>(recordCount) * recordSize;
-            if (stringsOffset > bytes.size() || stringSize > bytes.size() - stringsOffset ||
-                fieldStorageSize > bytes.size() - stringsOffset - stringSize)
-            {
-                WLOG_WARN("retail-db2: %s is truncated", filename);
-                return false;
-            }
-
-            const uint8_t* strings = bytes.data() + stringsOffset;
-            size_t resolved = 0;
-            for (uint32_t i = 0; i < recordCount; ++i)
-            {
-                const uint8_t* record = bytes.data() + recordsOffset + static_cast<size_t>(i) * recordSize;
-                const uint32_t id = ReadU32(record);
-                if (!wanted.contains(id)) continue;
-                const uint32_t stringOffset = ReadU32(record + 4);
-                if (stringOffset >= stringSize)
-                {
-                    WLOG_WARN("retail-db2: %s contains an invalid string offset", filename);
-                    return false;
-                }
-                const char* begin = reinterpret_cast<const char*>(strings + stringOffset);
-                const void* terminator = std::memchr(begin, '\0', stringSize - stringOffset);
-                if (!terminator)
-                {
-                    WLOG_WARN("retail-db2: %s contains an unterminated path", filename);
-                    return false;
-                }
-                const auto* end = static_cast<const char*>(terminator);
-                if (paths.try_emplace(id, begin, static_cast<size_t>(end - begin)).second) ++resolved;
-            }
-            WLOG_INFO("retail-db2: decoded %s rows=%u matched=%zu", filename, recordCount, resolved);
-            return true;
-        }
-
         bool ParsePathIndex(const std::unordered_set<uint32_t>& wanted,
                             std::unordered_map<uint32_t, std::string>& paths)
         {
-            // Read the same canonical DB2Gen tables the host resolver consumes. Keeping one archive-backed
-            // snapshot is important: a newer loose client alias paired with older host tables can resolve
-            // the same FileDataID differently across the IPC boundary and feed the renderer mismatched
-            // model/skin/texture families.
-            const bool textures = ParseWdc1PathTable("TextureFilePath.db2", wanted, paths);
-            const bool models = ParseWdc1PathTable("ModelFilePath.db2", wanted, paths);
+            constexpr uint32_t kMagic = 0x50465857u; // 'WXFP'
+            constexpr uint32_t kVersion = 1;
+            std::vector<uint8_t> bytes;
+            if (!ReadWholeFile("WXL\\DB2\\PATHS", bytes))
+            {
+                WLOG_WARN("retail-db2: host FileDataID path snapshot is unavailable");
+                return false;
+            }
+            const uint8_t* cursor = bytes.data();
+            const uint8_t* end = cursor + bytes.size();
+            const auto readU32 = [&cursor, end](uint32_t& value) {
+                if (static_cast<size_t>(end - cursor) < sizeof(value)) return false;
+                std::memcpy(&value, cursor, sizeof(value));
+                cursor += sizeof(value);
+                return true;
+            };
+            uint32_t magic = 0, version = 0, count = 0;
+            if (!readU32(magic) || !readU32(version) || !readU32(count) ||
+                magic != kMagic || version != kVersion)
+            {
+                WLOG_WARN("retail-db2: host FileDataID path snapshot is malformed");
+                return false;
+            }
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                uint32_t id = 0, length = 0;
+                if (!readU32(id) || !readU32(length) ||
+                    length > static_cast<size_t>(end - cursor))
+                {
+                    WLOG_WARN("retail-db2: host FileDataID path snapshot is truncated");
+                    return false;
+                }
+                if (wanted.contains(id))
+                    paths.try_emplace(id, reinterpret_cast<const char*>(cursor), length);
+                cursor += length;
+            }
+            if (cursor != end)
+            {
+                WLOG_WARN("retail-db2: host FileDataID path snapshot has trailing bytes");
+                return false;
+            }
             WLOG_INFO("retail-db2: resolved FileData paths=%zu/%zu", paths.size(), wanted.size());
-            return textures && models && !paths.empty();
+            return !paths.empty();
         }
 
         const std::string& PathOrEmpty(const std::unordered_map<uint32_t, std::string>& paths, uint32_t id)
@@ -336,8 +304,23 @@ namespace wxl::scripts::retaildb2
             return it == paths.end() ? empty : it->second;
         }
 
-        bool BuildIndexes()
+        bool BuildIndexes(std::unique_ptr<displaybuilder::MaterialService>& materialService)
         {
+            std::string catalogError;
+            if (!catalog::Validate(&catalogError))
+            {
+                WLOG_WARN("retail-db2: generated schema catalog is invalid: %s", catalogError.c_str());
+                return false;
+            }
+            const auto catalogSchemas = catalog::All();
+            const size_t availableSchemas = static_cast<size_t>(std::ranges::count_if(
+                catalogSchemas, [](const catalog::Schema& schema) { return schema.available; }));
+            size_t catalogRelationships = 0;
+            for (const catalog::Schema& schema : catalogSchemas)
+                catalogRelationships += schema.links.size();
+            WLOG_INFO("retail-db2: schema catalog tables=%zu available=%zu relationships=%zu",
+                      catalogSchemas.size(), availableSchemas, catalogRelationships);
+
             std::string schemaError;
             if (!runtimeDb2::ValidateDefinitions(schemas::All, &schemaError))
             {
@@ -444,6 +427,7 @@ namespace wxl::scripts::retaildb2
                 {
                     value.modelResources[i] = table.Value(row, "ModelResourcesID", i);
                     value.modelMaterials[i] = table.Value(row, "ModelMaterialResourcesID", i);
+                    value.modelTypes[i] = table.Value(row, "ModelType", i);
                     value.helmetVis[i] = table.Value(row, "HelmetGeosetVis", i);
                 }
                 for (size_t i = 0; i < 6; ++i) value.geosets[i] = table.Value(row, "GeosetGroup", i);
@@ -561,6 +545,7 @@ namespace wxl::scripts::retaildb2
                         : (displayInventoryTypes.contains(displayId) ? displayInventoryTypes.at(displayId) : 0),
                     raw.modelResources,
                     raw.modelMaterials,
+                    raw.modelTypes,
                 });
                 Display out;
                 out.id = displayId;
@@ -624,21 +609,21 @@ namespace wxl::scripts::retaildb2
             // retail display, consumes the refresh, and remains naked until a later login/logout rebuild.
             g_items = std::move(items);
             g_displays = std::move(displays);
+            // The demand material service keeps a read-only reference to this process-lifetime map.
+            // Publish it before moving the large display/material source maps into the service.
+            g_fileDataPaths = std::move(paths);
             g_lookupReady.store(true, std::memory_order_release);
 
-            auto itemDisplayIndex = displaybuilder::Build(
-                builderDisplays, modelFiles, componentModelPositions, textureFiles,
-                modelMaterials, componentMaterials,
-                appearanceOrder, paths,
+            materialService = displaybuilder::Build(
+                std::move(builderDisplays), modelFiles, componentModelPositions,
+                std::move(textureFiles), std::move(modelMaterials), componentMaterials,
+                appearanceOrder, g_fileDataPaths,
                 &ReadWholeFile);
-            if (!itemDisplayIndex)
+            if (!materialService)
             {
                 WLOG_WARN("retail-db2: failed to derive item-display attachment/material index");
                 return false;
             }
-            runtimeDb2::itemdisplay::Publish(std::move(itemDisplayIndex));
-
-            g_fileDataPaths = std::move(paths);
             return true;
         }
 
@@ -715,6 +700,103 @@ namespace wxl::scripts::retaildb2
             {
                 return false;
             }
+        }
+
+        bool NativeDisplayExists(uint32_t displayId)
+        {
+            if (!displayId) return false;
+            __try
+            {
+                const uint32_t minId = *reinterpret_cast<const uint32_t*>(db2::itemdisplayinfo::kMinId);
+                const uint32_t maxId = *reinterpret_cast<const uint32_t*>(db2::itemdisplayinfo::kMaxId);
+                void** table = *reinterpret_cast<void***>(db2::itemdisplayinfo::kIdTable);
+                return table && displayId >= minId && displayId <= maxId &&
+                       table[displayId - minId] != nullptr;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+        }
+
+        bool ApplyRetailCharacterGeosets(void* model, uint32_t robeGeoset,
+                                         uint32_t capeGeoset) noexcept
+        {
+            if (!model || (!robeGeoset && !capeGeoset)) return true;
+            __try
+            {
+                using SetGeometryVisibleFn = void (__thiscall*)(void*, uint32_t, uint32_t, int);
+                using OptimizeVisibleGeometryFn = void (__thiscall*)(void*);
+                const auto setVisible = wxl::game::Native<SetGeometryVisibleFn>(kSetGeometryVisible);
+
+                if (robeGeoset)
+                {
+                    setVisible(model, 501, 599, 0);
+                    setVisible(model, 902, 999, 0);
+                    setVisible(model, 1100, 1199, 0);
+                    setVisible(model, 1300, 1399, 0);
+                    setVisible(model, 1301 + robeGeoset, 1301 + robeGeoset, 1);
+                }
+                if (capeGeoset)
+                {
+                    setVisible(model, 1500, 1599, 0);
+                    setVisible(model, 1501 + capeGeoset, 1501 + capeGeoset, 1);
+                }
+                wxl::game::Native<OptimizeVisibleGeometryFn>(kOptimizeVisibleGeometry)(model);
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return false;
+            }
+        }
+
+        void __fastcall CharacterGeosRenderPrepDetour(void* cmo, void* edx)
+        {
+            if (g_originalCharacterGeosRenderPrep)
+                g_originalCharacterGeosRenderPrep(cmo, edx);
+
+            // GeosRenderPrep re-reads equipped display IDs through ItemDisplayInfo's inline
+            // min/max/id-table instead of the accessor hooked by LookupDetour.  Consequently a
+            // DB2-only robe reaches AddItem with GeosetGroup[2], but that value is lost when the
+            // character's body geometry is selected.  Mirror the stock chest branch after native
+            // prep, while leaving every real DBC row authoritative.
+            if (!cmo || !g_lookupReady.load(std::memory_order_acquire)) return;
+
+            uint32_t chestDisplayId = 0;
+            uint32_t capeDisplayId = 0;
+            void* model = nullptr;
+            __try
+            {
+                auto* bytes = static_cast<uint8_t*>(cmo);
+                chestDisplayId = *reinterpret_cast<const uint32_t*>(bytes + kCmoChestDisplay);
+                capeDisplayId = *reinterpret_cast<const uint32_t*>(bytes + kCmoCapeDisplay);
+                model = *reinterpret_cast<void**>(bytes + kCmoModel);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return;
+            }
+            if (!model) return;
+
+            uint32_t robeGeoset = 0;
+            uint32_t capeGeoset = 0;
+            if (chestDisplayId && !NativeDisplayExists(chestDisplayId))
+            {
+                const auto display = g_displays.find(chestDisplayId);
+                if (display != g_displays.end() && display->second.geosets[2] < 99)
+                    robeGeoset = display->second.geosets[2];
+            }
+            if (capeDisplayId && !NativeDisplayExists(capeDisplayId))
+            {
+                const auto display = g_displays.find(capeDisplayId);
+                if (display != g_displays.end() && display->second.geosets[0] < 99)
+                    capeGeoset = display->second.geosets[0];
+            }
+
+            if (!ApplyRetailCharacterGeosets(model, robeGeoset, capeGeoset))
+                WLOG_WARN("retail-db2: character geoset repair faulted chest=%u cape=%u",
+                          chestDisplayId, capeDisplayId);
         }
 
         uint32_t ItemIdFromObject(void* item)
@@ -911,13 +993,16 @@ namespace wxl::scripts::retaildb2
             return 1;
         }
 
-        /** Lua: ready, failed = GetRetailDB2Status(). */
+        /** Lua: ready, failed, resolvedMaterialDisplays = GetRetailDB2Status(). */
         int __cdecl ScriptGetRetailDb2Status(void* state)
         {
             const auto pushBoolean = wxl::game::Native<luaoff::LuaPushBooleanFn>(luaoff::kLuaPushBoolean);
             pushBoolean(state, g_ready.load(std::memory_order_acquire));
             pushBoolean(state, g_failed.load(std::memory_order_acquire));
-            return 2;
+            const auto current = runtimeDb2::itemdisplay::Current();
+            wxl::game::Native<luaoff::LuaPushNumberFn>(luaoff::kLuaPushNumber)(
+                state, current ? static_cast<double>(current->resolvedMaterialDisplays.size()) : 0.0);
+            return 3;
         }
 
         bool InstallStorageOverlay(uintptr_t minAddress, uintptr_t maxAddress, uintptr_t tableAddress,
@@ -1014,21 +1099,48 @@ namespace wxl::scripts::retaildb2
             const uint32_t native = g_originalLookup ? g_originalLookup(storage, edx, id, output) : 0;
             if (native || !g_lookupReady.load(std::memory_order_acquire)) return native;
             if (storage == reinterpret_cast<void*>(db2::item::kStorageObject)) return FillItem(id, output);
-            if (storage == reinterpret_cast<void*>(db2::itemdisplayinfo::kStorageObject)) return FillDisplay(id, output);
+            if (storage == reinterpret_cast<void*>(db2::itemdisplayinfo::kStorageObject))
+            {
+                const uint32_t found = FillDisplay(id, output);
+                if (found) runtimeDb2::itemdisplay::Request(id);
+                return found;
+            }
             return 0;
         }
 
         DWORD WINAPI LoadThread(LPVOID)
         {
+            // Storage installation intentionally waits only briefly so a slow host does not hold up
+            // the game's startup/UI thread. Retail DB2 indexing runs in the background and has no
+            // native fallback now that decoding belongs to the host, so wait here until the mailbox
+            // and all channel events are genuinely connectable. Previously the first Item snapshot
+            // request could race host startup, fail once, and permanently disable every retail item
+            // and icon for the session.
+            wxl::runtime::ipc::EnsureHostRunning();
+            bool hostReady = wxl::runtime::ipc::IsConnected();
+            for (uint32_t waited = 0; !hostReady && waited < 30000; waited += 100)
+            {
+                hostReady = wxl::runtime::ipc::Connect();
+                if (!hostReady) Sleep(100);
+            }
+            if (!hostReady)
+            {
+                g_failed.store(true, std::memory_order_release);
+                WLOG_WARN("retail-db2: disabled because the host was not ready after 30 seconds");
+                return 0;
+            }
+
             // Do not replace the client's inline ID tables. Several consumers retain internal pointers and
             // invariants beyond min/max/idTable; publishing a synthetic table caused a null-call crash shortly
             // after character selection. Keep the proven accessor-only fallback until those paths are hooked
             // individually.
-            const bool ok = BuildIndexes();
+            std::unique_ptr<displaybuilder::MaterialService> materialService;
+            const bool ok = BuildIndexes(materialService);
             g_failed.store(!ok, std::memory_order_release);
             g_ready.store(ok, std::memory_order_release);
             if (!ok) WLOG_WARN("retail-db2: disabled because startup indexing failed");
             else WLOG_INFO("retail-db2: ready items=%zu displays=%zu", g_items.size(), g_displays.size());
+            if (materialService) materialService->Run();
             return 0;
         }
 
@@ -1089,6 +1201,40 @@ do
         watcher:RegisterEvent("ADDON_LOADED")
         watcher:SetScript("OnEvent", wrapCContainer)
     end
+
+    -- Glue creates its character model while the host is still deriving the slow material phase.
+    -- Re-select the already selected character once that immutable snapshot is complete.  This runs
+    -- from Glue's UI thread, never from the DB2 loader or an M2 traversal callback.
+    local glueDb2Watcher = CreateFrame and CreateFrame("Frame")
+    if glueDb2Watcher then
+        local elapsed = 0
+        local lastResolved = -1
+        glueDb2Watcher:SetScript("OnUpdate", function(self, delta)
+            -- The same registered script also runs in FrameXML.  It has no Glue model to repair.
+            if WorldFrame and not CharacterSelect then
+                self:SetScript("OnUpdate", nil)
+                return
+            end
+            elapsed = elapsed + (delta or 0)
+            if elapsed < 0.25 then return end
+            elapsed = 0
+            local ready, failed, resolved = GetRetailDB2Status()
+            if failed then
+                self:SetScript("OnUpdate", nil)
+                return
+            end
+            if ready and CharacterSelect and CharacterSelect.IsShown and
+               CharacterSelect:IsShown() and CharacterSelect.selectedIndex and
+               CharacterSelect.selectedIndex > 0 and
+               type(CharacterSelect_SelectCharacter) == "function" then
+                resolved = resolved or 0
+                if resolved ~= lastResolved then
+                    lastResolved = resolved
+                    CharacterSelect_SelectCharacter(CharacterSelect.selectedIndex, 1)
+                end
+            end
+        end)
+    end
 end
 )lua");
             wxl::core::hook::Install("RetailDb2::DBCFirstLookup", db2::itemdisplayinfo::kLookup,
@@ -1109,6 +1255,9 @@ end
             wxl::core::hook::Install("RetailDb2::CanGoInSlot", kCanGoInSlot,
                                      reinterpret_cast<void*>(&CanGoInSlotDetour),
                                      reinterpret_cast<void**>(&g_originalCanGoInSlot));
+            wxl::core::hook::Install("RetailDb2::CharacterGeosRenderPrep", kCharacterGeosRenderPrep,
+                                     reinterpret_cast<void*>(&CharacterGeosRenderPrepDetour),
+                                     reinterpret_cast<void**>(&g_originalCharacterGeosRenderPrep));
             if (HANDLE thread = CreateThread(nullptr, 0, &LoadThread, nullptr, 0, nullptr))
                 CloseHandle(thread);
             else

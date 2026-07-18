@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "runtime/db2/ItemDisplayIndex.hpp"
+#include "wxl-host-extension/shared/db2/ItemDisplayIndex.hpp"
 
 #include <array>
 #include <cstdint>
@@ -21,6 +21,7 @@ namespace wxl::scripts::retaildb2::displaybuilder
         uint32_t inventoryType = 0;
         std::array<uint32_t, 2> modelResources{};
         std::array<uint32_t, 2> modelMaterials{};
+        std::array<uint32_t, 2> modelTypes{};
     };
 
     struct ModelMaterialSource
@@ -33,12 +34,22 @@ namespace wxl::scripts::retaildb2::displaybuilder
 
     using ReadAssetFn = bool (*)(const char* path, std::vector<uint8_t>& bytes);
 
-    std::shared_ptr<wxl::runtime::db2::itemdisplay::Index> Build(
-        const std::unordered_map<uint32_t, DisplaySource>& displays,
+    class MaterialService
+    {
+    public:
+        virtual ~MaterialService() = default;
+        virtual void Run() = 0;
+    };
+
+    // Publishes the direct and complete model snapshots, then returns the process-lifetime
+    // request-driven material service.  The large material source maps are transferred into the
+    // service instead of being copied or scanned eagerly.
+    std::unique_ptr<MaterialService> Build(
+        std::unordered_map<uint32_t, DisplaySource> displays,
         const std::unordered_map<uint32_t, std::vector<uint32_t>>& modelFiles,
         const std::unordered_map<uint32_t, uint32_t>& componentModelPositions,
-        const std::unordered_map<uint32_t, uint32_t>& textureFiles,
-        const std::unordered_map<uint32_t, std::vector<ModelMaterialSource>>& modelMaterials,
+        std::unordered_map<uint32_t, uint32_t> textureFiles,
+        std::unordered_map<uint32_t, std::vector<ModelMaterialSource>> modelMaterials,
         const std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>>& componentMaterials,
         const std::vector<uint32_t>& appearanceOrder,
         const std::unordered_map<uint32_t, std::string>& paths,
