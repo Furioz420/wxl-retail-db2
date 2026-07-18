@@ -138,7 +138,8 @@ reload-safe Lua API also exposes:
 - `GetRetailItemAppearance(itemIDOrLink)` -> `displayID, appearanceID, iconFileDataID` or `nil`
 - `GetRetailFileDataPath(fileDataID)` -> the canonical path for FileDataIDs already indexed as dependencies
   of the loaded item/display DB2 rows, or `nil`
-- `GetRetailDB2Status()` -> `ready, failed`, allowing addons to wait for background indexing
+- `GetRetailDB2Status()` -> `ready, failed, resolvedMaterialDisplays`, allowing addons to wait for
+  background indexing and observe how many requested display IDs have finished material resolution
 
 The item icon lookup retains the selected `ItemModifiedAppearance -> ItemAppearance` relationship. It does
 not collapse the item to a display and select an arbitrary icon when several appearances share that display.
@@ -157,7 +158,10 @@ old-client targeting information is derived directly from each referenced `.skin
 slot geosets and batch-to-section mappings target `ItemDisplayInfoModelMatRes` layers. The equip extension
 therefore no longer reads `WXLItemDisplayModels.csv` or `WXLItemDisplayModelMaterials.csv`.
 
-Publication uses three immutable snapshots: direct object models first, then the complete model/geoset index,
-and finally material/SKIN targeting with `materialsReady=true`. Each phase is swapped atomically; until a
-phase is available, the equip extension retains the normal DBC path and retries the shared snapshot on the
-next rebuild. Consumers never observe a snapshot while it is being constructed.
+Publication starts with immutable direct-object data and then the complete model/geoset index. Material/SKIN
+targeting is demand-driven: consumers request a display ID, the background service clones the current
+snapshot, resolves that display's material rows, records the ID in `resolvedMaterialDisplays` (including valid
+negative results), and atomically publishes the cumulative result. `materialsReady` remains false because
+there is no global all-materials phase. Until its display ID is marked resolved, the equip extension retains
+the normal DBC path and retries the shared snapshot on the next rebuild. Consumers never observe a snapshot
+while it is being constructed.
