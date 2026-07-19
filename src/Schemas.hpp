@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "wxl-host-extension/shared/db2/Db2.hpp"
+#include "runtime/db2/Db2.hpp"
 
 #include <array>
 
